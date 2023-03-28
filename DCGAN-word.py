@@ -1,24 +1,24 @@
-from typing import Callable, Tuple
-import argparse
 from argparse import ArgumentParser
+import random
 
 import torch
 from torch import nn
 from torch.utils.data import DataLoader, Dataset
+from torchmetrics import HingeLoss
 from tqdm import tqdm
 
 
-LETTER_LABELS = {
-    'a': 0,
-    'b': 1,
-    'c': 2,
-    'd': 3,
-    'e': 4,
-    'f': 5,
-    'g': 6,
-    'h': 7,
-    'i': 8,
-    'j': 9,
+LABELS = {
+    'a':  0,
+    'b':  1,
+    'c':  2,
+    'd':  3,
+    'e':  4,
+    'f':  5,
+    'g':  6,
+    'h':  7,
+    'i':  8,
+    'j':  9,
     'k': 10,
     'l': 11,
     'm': 12,
@@ -35,18 +35,19 @@ LETTER_LABELS = {
     'x': 23,
     'y': 24,
     'z': 25,
-    ' ': 26
+    ' ': 26,
 }
-LETTER_REVERSE_LABELS = 'abcdefghijklmnopqrstuvwxyz '
+
+INVERSE_LABELS = 'abcdefghijklmnopqrstuvwxyz '
 
 
-def accept_parameters() -> None:
-    global DEVICE, CHECK_DATA, LEARNING_RATE, BATCH_SIZE, EPOCHS, NUM_WORKERS, GENERATOR_CHECKPOINT, DISCRIMINATOR_CHECKPOINT, NOISE_DIMENSION, TERMINATE_COUNT
+def accept_parameters():
+    global DEVICE, LEARNING_RATE, BATCH_SIZE, EPOCHS, NUM_WORKERS, GENERATOR_CHECKPOINT, DISCRIMINATOR_CHECKPOINT, NOISE_DIMENSION, TERMINATE_COUNT
 
-    parser: ArgumentParser = ArgumentParser()
+    parser = ArgumentParser()
     parser.add_argument('--device', type=str, default='cpu', choices=['cpu', 'cuda', 'mps'])
-    parser.add_argument('--check_data', action='store_true')
     parser.add_argument('--learning_rate', type=float, default=1e-3)
+    parser.add_argument('--batch_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--num_workers', type=int, default=3)
     parser.add_argument('--generator_checkpoint', type=str, default=None)
@@ -54,10 +55,10 @@ def accept_parameters() -> None:
     parser.add_argument('--noise_dimension', type=int, default=128)
     parser.add_argument('--terminate_count', type=int, default=10)
     
-    args: argparse.Namespace = parser.parse_args()
+    args                     = parser.parse_args()
     DEVICE                   = torch.device(args.device)
-    CHECK_DATA               = args.check_data
     LEARNING_RATE            = args.learning_rate
+    BATCH_SIZE               = args.batch_size
     EPOCHS                   = args.epochs
     NUM_WORKERS              = args.num_workers
     GENERATOR_CHECKPOINT     = args.generator_checkpoint
@@ -66,153 +67,167 @@ def accept_parameters() -> None:
     TERMINATE_COUNT          = args.terminate_count
     
     
-def load_model(path: str) -> nn.Module:
-    return torch.load(path)
-    
-    
 class EnglishWords(Dataset):
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, words, max_length):
+        super(EnglishWords, self).__init__()
         
-        with open('data/words_alpha.txt') as f:
-            self.data = f.read().split('\n')[:-1]
-            
-        longest: int = 0
-        for word in self.data:
-            longest = max(longest, len(word))
-        for i in range(len(self.data)):
-            self.data[i] += ' ' * (longest - len(self.data[i]))
-            
-    def __getitem__(self, index: int) -> torch.Tensor:
-        data = torch.zeros(len(self.data[index]), len(LETTER_LABELS))
-        for i, c in enumerate(self.data[index]):
-            data[i][LETTER_LABELS[c]] = 1
-            
-        return data, 1
-    
-    def __len__(self) -> int:
+        self.max_length = max_length
+        
+        self.data = []
+        for word in words:
+            self.data.append([])
+            for c in word:
+                self.data[-1].append(LABELS[c])
+            self.data[-1].extend([LABELS[' ']] * (max_length - len(self.data[-1])))
+                
+        self.data = torch.tensor(self.data)
+        
+    def __len__(self):
         return len(self.data)
+    
+    def __getitem__(self, i):
+        return nn.functional.one_hot(self.data[i], num_classes=len(LABELS)).to(torch.float32)
+    
+    
+def get_dataset(test_ratio=0.1):
+    with open('data/words_alpha.txt', 'r') as f:
+        words = f.read().split()
+        
+    random.shuffle(words)
+    max_length = max([len(word) for word in words])
+    
+    training_data = EnglishWords(words[:int(len(words) * (1 - test_ratio))], max_length)
+    test_data     = EnglishWords(words[int(len(words) * (1 - test_ratio)):], max_length)
+
+    return training_data, test_data, max_length
+    
+    
+def load_model(path):
+    return torch.load(path)
 
 
 class Generator(nn.Module):
-    @classmethod
-    def generate_noise(cls, device: torch.device, batch_size: int = 1) -> torch.Tensor:
-        noise_size = ((len(LETTER_REVERSE_LABELS) * 2 + 3) * 2 + 3) * 2 + 3
-        return torch.randn(batch_size, 1, noise_size, device=device)
-    
-    @classmethod
-    def generate_word(cls, x: torch.Tensor) -> torch.Tensor:
-        return [''.join(''.join([LETTER_REVERSE_LABELS[torch.argmax(letter_tensor)] for letter_tensor in word_tensor]).split()) for word_tensor in x]
-    
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(
+        self,
+        noise_dimension,
+        output_length,
+        feature_map_size=64,
+    ) -> None:
+        super(Generator, self).__init__()
         
-        self.net: nn.Module = nn.Sequential(
-            nn.Conv1d(1, 4, 4, 1, 0, bias=False),
+        self.noise_dimension = noise_dimension
+        self.output_length   = output_length
+        
+        self.net = nn.Sequential(
+            nn.Linear(noise_dimension, feature_map_size * 4),
             nn.ReLU(),
-            nn.MaxPool1d(2, 2),
-            nn.Conv1d(4, 16, 4, 1, 0, bias=False),
+            nn.Linear(feature_map_size * 4, feature_map_size * 2),
             nn.ReLU(),
-            nn.MaxPool1d(2, 2),
-            nn.Conv1d(16, 32, 4, 1, 0, bias=False),
+            nn.Linear(feature_map_size * 2, feature_map_size),
             nn.ReLU(),
-            nn.MaxPool1d(2, 2),
+            nn.Linear(feature_map_size, self.output_length * len(LABELS))
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+    def forward(self, x):
+        x = self.net(x)
+        out = torch.zeros(len(x), self.output_length, len(LABELS))
+        
+        softmax = nn.Softmax(dim=0)
+        for i in range(self.output_length):
+            idx = torch.argmax(softmax(x[:, i * len(LABELS):(i + 1) * len(LABELS)]), dim=1)
+            for j, jdx in enumerate(idx):
+                out[j][i][jdx] = 1
+            
+        return out
+    
+    def generate_noise(self, batch_size):
+        return torch.randn(batch_size, self.noise_dimension)
+    
+    @classmethod
+    def decode(cls, x):
+        words = []
+        for word in x:
+            words.append('')
+            for c in word:
+                words[-1] += INVERSE_LABELS[torch.argmax(c)] if sum(c) else ' '
+        
+        return words
     
     
 class Discriminator(nn.Module):
     def __init__(
         self,
-        device,
-        input_size: int = len(LETTER_REVERSE_LABELS),
-        hidden_size: int = 32
+        input_length,
+        feature_map_size=64
     ) -> None:
-        super().__init__()
+        super(Discriminator, self).__init__()
         
-        self.hidden_size = hidden_size
+        self.net = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(input_length * len(LABELS), feature_map_size),
+            nn.ReLU(),
+            nn.Linear(feature_map_size, 1),
+            nn.Sigmoid()
+        )
 
-        self.i2h = nn.Linear(input_size + hidden_size, hidden_size)
-        self.i2o = nn.Linear(input_size + hidden_size, 1)
-        self.softmax = nn.LogSoftmax(dim=1)
-        
-        self.hidden = torch.zeros(1, self.hidden_size, device=device)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        combined = torch.cat((x, self.hidden), 1)
-        self.hidden = self.i2h(combined)
-        output = self.i2o(combined)
-        output = self.softmax(output)
-        return output
+    def forward(self, x):
+        return self.net(x)
     
     
 class GANTrainer:
     def __init__(
         self,
-        training_data: Dataset,
-        device: torch.device,
-        generator: nn.Module,
-        discriminator: nn.Module,
-        learning_rate: float,
-        num_workers: int
-    ) -> None:
-        self.batch_size = 1
-        self.device: torch.device = device
-        
+        training_data,
+        device,
+        generator,
+        discriminator,
+        learning_rate,
+        batch_size,
+        num_workers
+    ):
         self.DISCRIMINATOR_TARGETS = {
-            'real': torch.ones(self.batch_size, 1, device=self.device),
-            'fake': torch.zeros(self.batch_size, 1, device=self.device)
+            'real': torch.ones(batch_size, 1),
+            'fake': torch.zeros(batch_size, 1)
         }
         
-        self.generator: nn.Module = generator.to(self.device)
-        self.discriminator: nn.Module = discriminator.to(self.device)
+        self.device = device
         
-        self.learning_rate: float = learning_rate
-        self.num_workers: int     = num_workers
+        self.generator     = generator.to(self.device)
+        self.discriminator = discriminator.to(self.device)
         
-        self.loss_function: Callable = nn.BCELoss()
+        self.learning_rate = learning_rate
+        self.batch_size    = batch_size
+        self.num_workers   = num_workers
         
-        self.generator_optimizer: torch.optim.Optimizer     = torch.optim.Adam(self.generator.parameters(), lr=self.learning_rate)
-        self.discriminator_optimizer: torch.optim.Optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=self.learning_rate)
+        self.loss_function = HingeLoss()
         
-        self.training_loader: DataLoader = DataLoader(
+        self.generator_optimizer     = torch.optim.Adam(self.generator.parameters(), lr=self.learning_rate)
+        self.discriminator_optimizer = torch.optim.Adam(self.discriminator.parameters(), lr=self.learning_rate)
+        
+        self.training_loader = DataLoader(
             training_data,
             batch_size=self.batch_size,
             shuffle=True,
             num_workers=self.num_workers,
             pin_memory=True,
-            drop_last=True
+            drop_last=True,
         )
 
-    def train_loop(self) -> Tuple[float, float]:
-        generator_loss_sum: float = 0
-        discriminator_loss_sum: float = 0
-        for input, _ in tqdm(self.training_loader, desc='training'):
-            input = input.to(self.device)
-            generator_output: torch.Tensor = self.generator(Generator.generate_noise(self.device, self.batch_size))
+    def train_loop(self):
+        generator_loss_sum = 0
+        discriminator_loss_sum = 0
+        for input in tqdm(self.training_loader, desc='training'):
+            generator_output = self.generator(self.generator.generate_noise(self.batch_size))
             
-            real_prediction: torch.Tensor
-            for i in range(len(input[0])):
-                real_prediction = self.discriminator(input[:, i])
-            fake_prediction: torch.Tensor
-            for i in range(len(generator_output.detach()[0])):
-                fake_prediction = self.discriminator(generator_output.detach()[:, i])
-            
-            discriminator_loss: nn.Module = \
-                self.loss_function(real_prediction, self.DISCRIMINATOR_TARGETS['real']) + \
-                self.loss_function(fake_prediction, self.DISCRIMINATOR_TARGETS['fake'])
+            discriminator_loss = \
+                self.loss_function(self.discriminator(input), self.DISCRIMINATOR_TARGETS['real']) + \
+                self.loss_function(self.discriminator(generator_output.detach()), self.DISCRIMINATOR_TARGETS['fake'])
 
             self.discriminator_optimizer.zero_grad()
             discriminator_loss.backward()
             self.discriminator_optimizer.step()
-            
-            prediction: torch.Tensor
-            for i in range(len(generator_output[0])):
-                prediction = self.discriminator(generator_output[:, i])
 
-            generator_loss: nn.Module = self.loss_function(prediction, self.DISCRIMINATOR_TARGETS['real'])
+            generator_loss = self.loss_function(self.discriminator(generator_output), self.DISCRIMINATOR_TARGETS['real'])
             
             self.generator_optimizer.zero_grad()
             generator_loss.backward()
@@ -222,20 +237,22 @@ class GANTrainer:
             discriminator_loss_sum += discriminator_loss
             
         return generator_loss_sum / self.batch_size, discriminator_loss_sum / self.batch_size
+    
+    def save_model(self, path):
+        torch.save(self.model, path)
         
-    def print_output(self) -> None:
-        tqdm.write(f'{Generator.generate_word(self.generator(Generator.generate_noise(8)))}')
+    def save_output(self, epoch, samples=5):
+        with open(f'outputs/GANword/{epoch:04}.txt', 'w') as f:
+            f.write('\n'.join(Generator.decode(self.generator(self.generator.generate_noise(samples)))))
         
-    def run(self, epochs: int, terminate_count: int, save_path: str = 'models/model.pth') -> None:
-        min_generator_loss: float     = float('inf')
-        min_discriminator_loss: float = float('inf')
-        update_count: int = 0
-        for _ in tqdm(range(epochs), desc='epoch'):
-            generator_loss: float
-            discriminator_loss: float
+    def run(self, epochs, terminate_count, save_path='models/model.pth'):
+        min_generator_loss     = float('inf')
+        min_discriminator_loss = float('inf')
+        update_count = 0
+        for epoch in tqdm(range(epochs), desc='epoch'):
             generator_loss, discriminator_loss = self.train_loop()
             
-            self.print_output()
+            self.save_output(epoch)
             
             if min_generator_loss > generator_loss:
                 min_generator_loss = generator_loss
@@ -245,26 +262,27 @@ class GANTrainer:
                 update_count = 0
             update_count += 1
             
-            tqdm.write(
-                f'generator_loss: {generator_loss:0.7f}, min_generator_loss: {min_generator_loss:>0.7f}\n\
-                discriminator_loss: {discriminator_loss:0.7f}, min_discriminator_loss: {min_discriminator_loss:>0.7f}\n'
-            )
+            tqdm.write(f'generator_loss: {generator_loss:0.7f}, min_generator_loss: {min_generator_loss:>0.7f}')
+            tqdm.write(f'discriminator_loss: {discriminator_loss:0.7f}, min_discriminator_loss: {min_discriminator_loss:>0.7f}\n')
             
             if update_count >= terminate_count:
                 break
+            
+        # self.save_model(save_path)
 
 
 if __name__ == '__main__':
     accept_parameters()
-
-    training_data: EnglishWords = EnglishWords()
     
-    generator: Generator         = Generator()
+    training_data, test_data, max_length = get_dataset(test_ratio=0)
+    
+    generator = Generator(NOISE_DIMENSION, max_length)
     if GENERATOR_CHECKPOINT != None:
         generator = load_model(GENERATOR_CHECKPOINT)
-    discriminator: Discriminator = Discriminator(DEVICE)
-    if DISCRIMINATOR_CHECKPOINT != None:
-        generator = load_model(DISCRIMINATOR_CHECKPOINT)
 
-    trainer: GANTrainer = GANTrainer(training_data, DEVICE, generator, discriminator, LEARNING_RATE, NUM_WORKERS)
+    discriminator: Discriminator = Discriminator(max_length)
+    if DISCRIMINATOR_CHECKPOINT != None:
+        discriminator = load_model(DISCRIMINATOR_CHECKPOINT)
+
+    trainer: GANTrainer = GANTrainer(training_data, DEVICE, generator, discriminator, LEARNING_RATE, BATCH_SIZE, NUM_WORKERS)
     trainer.run(EPOCHS, TERMINATE_COUNT)
